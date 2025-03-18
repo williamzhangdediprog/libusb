@@ -73,7 +73,7 @@
 #endif
 
 /* The following is used to silence warnings for unused variables */
-#if defined(UNREFERENCED_PARAMETER)
+#if defined(UNREFERENCED_PARAMETER) && !defined(__GNUC__)
 #define UNUSED(var)	UNREFERENCED_PARAMETER(var)
 #else
 #define UNUSED(var)	do { (void)(var); } while(0)
@@ -128,6 +128,7 @@ typedef atomic_long usbi_atomic_t;
  *   return_type LIBUSB_CALL function_name(params);
  */
 #define API_EXPORTED LIBUSB_CALL DEFAULT_VISIBILITY
+#define API_EXPORTEDV LIBUSB_CALLV DEFAULT_VISIBILITY
 
 #ifdef __cplusplus
 extern "C" {
@@ -321,18 +322,19 @@ void usbi_log(struct libusb_context *ctx, enum libusb_log_level level,
 
 #else /* ENABLE_LOGGING */
 
-#define usbi_err(ctx, ...)	UNUSED(ctx)
-#define usbi_warn(ctx, ...)	UNUSED(ctx)
-#define usbi_info(ctx, ...)	UNUSED(ctx)
-#define usbi_dbg(ctx, ...)	do {} while (0)
+#define usbi_err(ctx, ...)	do { (void)(ctx); } while(0)
+#define usbi_warn(ctx, ...)	do { (void)(ctx); } while(0)
+#define usbi_info(ctx, ...)	do { (void)(ctx); } while(0)
+#define usbi_dbg(ctx, ...)	do { (void)(ctx); } while(0)
 
 #endif /* ENABLE_LOGGING */
 
 #define DEVICE_CTX(dev)		((dev)->ctx)
-#define HANDLE_CTX(handle)	(DEVICE_CTX((handle)->dev))
-#define TRANSFER_CTX(transfer)	(HANDLE_CTX((transfer)->dev_handle))
+#define HANDLE_CTX(handle)	((handle) ? DEVICE_CTX((handle)->dev) : NULL)
 #define ITRANSFER_CTX(itransfer) \
-	(TRANSFER_CTX(USBI_TRANSFER_TO_LIBUSB_TRANSFER(itransfer)))
+	((itransfer)->dev ? DEVICE_CTX((itransfer)->dev) : NULL)
+#define TRANSFER_CTX(transfer) \
+	(ITRANSFER_CTX(LIBUSB_TRANSFER_TO_USBI_TRANSFER(transfer)))
 
 #define IS_EPIN(ep)		(0 != ((ep) & LIBUSB_ENDPOINT_IN))
 #define IS_EPOUT(ep)		(!IS_EPIN(ep))
@@ -378,7 +380,7 @@ struct libusb_context {
 	struct list_head flying_transfers;
 	/* Note paths taking both this and usbi_transfer->lock must always
 	 * take this lock first */
-	usbi_mutex_t flying_transfers_lock;
+	usbi_mutex_t flying_transfers_lock; /* for flying_transfers and timeout_flags */
 
 #if !defined(PLATFORM_WINDOWS)
 	/* user callbacks for pollfd changes */
@@ -435,13 +437,26 @@ struct libusb_context {
 };
 
 extern struct libusb_context *usbi_default_context;
+extern struct libusb_context *usbi_fallback_context;
 
 extern struct list_head active_contexts_list;
 extern usbi_mutex_static_t active_contexts_lock;
 
 static inline struct libusb_context *usbi_get_context(struct libusb_context *ctx)
 {
-	return ctx ? ctx : usbi_default_context;
+	static int warned = 0;
+
+	if (!ctx) {
+		ctx = usbi_default_context;
+	}
+	if (!ctx) {
+		ctx = usbi_fallback_context;
+		if (ctx && warned == 0) {
+			usbi_err(ctx, "API misuse! Using non-default context as implicit default.");
+			warned = 1;
+		}
+	}
+	return ctx;
 }
 
 enum usbi_event_flags {
@@ -519,7 +534,7 @@ static inline void usbi_localize_device_descriptor(struct libusb_device_descript
 	desc->bcdDevice = libusb_le16_to_cpu(desc->bcdDevice);
 }
 
-#ifdef HAVE_CLOCK_GETTIME
+#if defined(HAVE_CLOCK_GETTIME) && !defined(__APPLE__)
 static inline void usbi_get_monotonic_time(struct timespec *tp)
 {
 	ASSERT_EQ(clock_gettime(CLOCK_MONOTONIC, tp), 0);
@@ -548,8 +563,11 @@ void usbi_get_real_time(struct timespec *tp);
  * 2. struct usbi_transfer
  * 3. struct libusb_transfer (which includes iso packets) [variable size]
  *
- * from a libusb_transfer, you can get the usbi_transfer by rewinding the
- * appropriate number of bytes.
+ * You can convert between them with the macros:
+ *  TRANSFER_PRIV_TO_USBI_TRANSFER
+ *  USBI_TRANSFER_TO_TRANSFER_PRIV
+ *  USBI_TRANSFER_TO_LIBUSB_TRANSFER
+ *  LIBUSB_TRANSFER_TO_USBI_TRANSFER
  */
 
 struct usbi_transfer {
@@ -560,7 +578,11 @@ struct usbi_transfer {
 	int transferred;
 	uint32_t stream_id;
 	uint32_t state_flags;   /* Protected by usbi_transfer->lock */
-	uint32_t timeout_flags; /* Protected by the flying_stransfers_lock */
+	uint32_t timeout_flags; /* Protected by the flying_transfers_lock */
+
+	/* The device reference is held until destruction for logging
+	 * even after dev_handle is set to NULL.  */
+	struct libusb_device *dev;
 
 	/* this lock is held during libusb_submit_transfer() and
 	 * libusb_cancel_transfer() (allowing the OS backend to prevent duplicate
@@ -598,10 +620,21 @@ enum usbi_transfer_timeout_flags {
 	USBI_TRANSFER_TIMED_OUT = 1U << 2,
 };
 
+#define TRANSFER_PRIV_TO_USBI_TRANSFER(transfer_priv) \
+	((struct usbi_transfer *)			\
+	 ((unsigned char *)(transfer_priv)	\
+	  + PTR_ALIGN(sizeof(*transfer_priv))))
+
+#define USBI_TRANSFER_TO_TRANSFER_PRIV(itransfer) \
+	((unsigned char *)			\
+	 ((unsigned char *)(itransfer)	\
+	  - PTR_ALIGN(usbi_backend.transfer_priv_size)))
+
 #define USBI_TRANSFER_TO_LIBUSB_TRANSFER(itransfer)	\
 	((struct libusb_transfer *)			\
 	 ((unsigned char *)(itransfer)			\
 	  + PTR_ALIGN(sizeof(struct usbi_transfer))))
+
 #define LIBUSB_TRANSFER_TO_USBI_TRANSFER(transfer)	\
 	((struct usbi_transfer *)			\
 	 ((unsigned char *)(transfer)			\
@@ -660,7 +693,7 @@ struct usbi_interface_descriptor {
 struct usbi_string_descriptor {
 	uint8_t  bLength;
 	uint8_t  bDescriptorType;
-	uint16_t wData[ZERO_SIZED_ARRAY];
+	uint16_t wData[LIBUSB_FLEXIBLE_ARRAY];
 } LIBUSB_PACKED;
 
 struct usbi_bos_descriptor {
@@ -776,6 +809,9 @@ int usbi_handle_transfer_completion(struct usbi_transfer *itransfer,
 int usbi_handle_transfer_cancellation(struct usbi_transfer *itransfer);
 void usbi_signal_transfer_completion(struct usbi_transfer *itransfer);
 
+void usbi_attach_device(struct libusb_device *dev);
+void usbi_detach_device(struct libusb_device *dev);
+
 void usbi_connect_device(struct libusb_device *dev);
 void usbi_disconnect_device(struct libusb_device *dev);
 
@@ -795,6 +831,7 @@ struct usbi_option {
   int is_set;
   union {
     int ival;
+    libusb_log_cb log_cbval;
   } arg;
 };
 
@@ -873,7 +910,7 @@ static inline void *usbi_get_transfer_priv(struct usbi_transfer *itransfer)
 struct discovered_devs {
 	size_t len;
 	size_t capacity;
-	struct libusb_device *devices[ZERO_SIZED_ARRAY];
+	struct libusb_device *devices[LIBUSB_FLEXIBLE_ARRAY];
 };
 
 struct discovered_devs *discovered_devs_append(
@@ -1162,6 +1199,8 @@ struct usbi_os_backend {
 	 * claiming, no other drivers/applications can use the interface because
 	 * we now "own" it.
 	 *
+	 * This function gets called with dev_handle->lock locked!
+	 *
 	 * Return:
 	 * - 0 on success
 	 * - LIBUSB_ERROR_NOT_FOUND if the interface does not exist
@@ -1180,6 +1219,8 @@ struct usbi_os_backend {
 	 *
 	 * You will only ever be asked to release an interface which was
 	 * successfully claimed earlier.
+	 *
+	 * This function gets called with dev_handle->lock locked!
 	 *
 	 * Return:
 	 * - 0 on success
@@ -1317,7 +1358,7 @@ struct usbi_os_backend {
 	 *
 	 * This function must not block.
 	 *
-	 * This function gets called with the flying_transfers_lock locked!
+	 * This function gets called with itransfer->lock locked!
 	 *
 	 * Return:
 	 * - 0 on success
@@ -1331,6 +1372,8 @@ struct usbi_os_backend {
 	 * This function must not block. The transfer cancellation must complete
 	 * later, resulting in a call to usbi_handle_transfer_cancellation()
 	 * from the context of handle_events.
+	 *
+	 * This function gets called with itransfer->lock locked!
 	 */
 	int (*cancel_transfer)(struct usbi_transfer *itransfer);
 

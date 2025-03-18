@@ -131,6 +131,7 @@ typedef LONG USBD_STATUS;
 
 #define USBD_SUCCESS(Status)		((USBD_STATUS)(Status) >= 0)
 
+#define USBD_STATUS_STALL_PID		((USBD_STATUS)0xC0000004L)
 #define USBD_STATUS_ENDPOINT_HALTED	((USBD_STATUS)0xC0000030L)
 #define USBD_STATUS_TIMEOUT		((USBD_STATUS)0xC0006000L)
 #define USBD_STATUS_DEVICE_GONE		((USBD_STATUS)0xC0007000L)
@@ -153,7 +154,8 @@ enum windows_version {
 	WINDOWS_8,
 	WINDOWS_8_1,
 	WINDOWS_10,
-	WINDOWS_11_OR_LATER
+	WINDOWS_11,
+	WINDOWS_12_OR_LATER
 };
 
 extern enum windows_version windows_version;
@@ -230,12 +232,29 @@ typedef struct USB_DK_TRANSFER_REQUEST {
 	USB_DK_TRANSFER_RESULT Result;
 } USB_DK_TRANSFER_REQUEST, *PUSB_DK_TRANSFER_REQUEST;
 
+/* track devices that are removed, kept unchanged, added when updating device list
+ * using system enumeration in response to low-level hotplug events */
+ enum hotplug_status {
+	/* device is still in system enumeration as it was in previous enumeration.
+	 * There is no need to take any action */
+	UNCHANGED,
+
+	/* device is newly added to the list, meaning it just appeared in system enumeration.
+	 * A hotplug "device arrived" event shall be triggered */
+	ARRIVED,
+
+	/* device is no longer present in system enumeration.
+	 * A hotplug "device left" event shall be triggered and the device removed from the list */
+	LEFT
+};
+
 struct usbdk_device_priv {
 	USB_DK_DEVICE_ID ID;
 	PUSB_CONFIGURATION_DESCRIPTOR *config_descriptors;
 	HANDLE redirector_handle;
 	HANDLE system_handle;
 	uint8_t active_configuration;
+	enum hotplug_status hotplug_status; /* updated while getting current device list */
 };
 
 struct winusb_device_priv {
@@ -256,10 +275,18 @@ struct winusb_device_priv {
 		int current_altsetting;
 		bool restricted_functionality;  // indicates if the interface functionality is restricted
 						// by Windows (eg. HID keyboards or mice cannot do R/W)
+		uint8_t num_associated_interfaces; // If non-zero, the interface is part of a grouped
+		                                   // set of associated interfaces (defined by an IAD)
+						   // and this is the number of interfaces within the
+						   // associated group (bInterfaceCount in IAD).
+		uint8_t first_associated_interface; // For associated interfaces, this is the index of
+						    // the first interface (bFirstInterface in IAD) for
+		                                    // the grouped set of associated interfaces.
 	} usb_interface[USB_MAXINTERFACES];
 	struct hid_device_priv *hid;
 	PUSB_CONFIGURATION_DESCRIPTOR *config_descriptor; // list of pointers to the cached config descriptors
 	GUID class_guid; // checked for change during re-enumeration
+	enum hotplug_status hotplug_status; /* updated while getting current device list */
 };
 
 struct usbdk_device_handle_priv {
@@ -309,8 +336,7 @@ struct winusb_transfer_priv {
 struct windows_backend {
 	int (*init)(struct libusb_context *ctx);
 	void (*exit)(struct libusb_context *ctx);
-	int (*get_device_list)(struct libusb_context *ctx,
-		struct discovered_devs **discdevs);
+	int (*get_device_list)(struct libusb_context *ctx); // Refresh ctx device list with devices currently connected to the system and update the `hotplug_status` field of all enumerated devices.
 	int (*open)(struct libusb_device_handle *dev_handle);
 	void (*close)(struct libusb_device_handle *dev_handle);
 	int (*get_active_config_descriptor)(struct libusb_device *device,
